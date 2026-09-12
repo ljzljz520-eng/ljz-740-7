@@ -2,15 +2,23 @@
  * Deterministic stand-in for the real native voiceprint library.
  * It implements the exact vp.h ABI so the Go binding can be built,
  * tested and demonstrated; swap in the real .a/.so in production.
+ *
+ * The model file genuinely parameterizes extraction: its bytes seed a
+ * deterministic PRNG that expands into a projection matrix, and the
+ * embedding is a model-dependent transform of the audio spectrum. The
+ * same model file always yields the same embedding, while different
+ * model files yield different embeddings for the same audio.
  */
 #include "vp.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #define VP_DIM 256
 #define VP_MAX_ANALYSIS 8192
+#define VP_BANDS 64 /* spectral bands feeding the model projection */
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -36,8 +44,23 @@ const char *vp_last_error(void) { return vp_tls_err; }
 
 struct vp_engine {
     unsigned long model_size;
-    unsigned long model_checksum; /* FNV-1a, to pretend the model matters */
+    unsigned long model_checksum;  /* FNV-1a of the model file */
+    float proj[VP_DIM * VP_BANDS]; /* projection derived from the model */
 };
+
+/* splitmix64: a deterministic PRNG that expands the model identity into
+ * projection weights, so the model bytes decide the feature transform. */
+static uint64_t vp_next_u64(uint64_t *state) {
+    uint64_t z = (*state += 0x9E3779B97F4A7C15ULL);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+/* Next uniform variate in [-1, 1). */
+static float vp_next_unit(uint64_t *state) {
+    return (float)((double)(vp_next_u64(state) >> 40) / (double)(1ULL << 24) * 2.0 - 1.0);
+}
 
 vp_engine_t *vp_engine_create(const char *model_path, char *err, size_t err_cap) {
     if (model_path == NULL || model_path[0] == '\0') {
@@ -70,6 +93,15 @@ vp_engine_t *vp_engine_create(const char *model_path, char *err, size_t err_cap)
     }
     e->model_size = size;
     e->model_checksum = hash;
+
+    /* Expand the model identity into the projection applied at extract
+     * time: the same model file always produces the same transform, and
+     * different model files produce different embeddings. */
+    uint64_t st = (uint64_t)hash ^ ((uint64_t)size * 0x9E3779B97F4A7C15ULL);
+    double scale = 1.0 / sqrt((double)VP_BANDS);
+    for (int i = 0; i < VP_DIM * VP_BANDS; i++) {
+        e->proj[i] = (float)((double)vp_next_unit(&st) * scale);
+    }
     vp_clear(err, err_cap);
     return e;
 }
@@ -102,16 +134,30 @@ int vp_engine_extract(vp_engine_t *e,
     }
 
     int m = n < VP_MAX_ANALYSIS ? n : VP_MAX_ANALYSIS;
-    /* Stand-in embedding: log-magnitude of a coarse DFT. */
-    for (int k = 0; k < VP_DIM; k++) {
-        double freq = (double)(k + 1) * ((double)sample_rate / 2.0) / (double)VP_DIM;
+
+    /* Front end (model-independent): log-magnitude of a coarse DFT,
+     * reduced to VP_BANDS spectral bands. */
+    float bands[VP_BANDS];
+    for (int b = 0; b < VP_BANDS; b++) {
+        double freq = (double)(b + 1) * ((double)sample_rate / 2.0) / (double)VP_BANDS;
         double w = 2.0 * M_PI * freq / (double)sample_rate;
         double re = 0.0, im = 0.0;
         for (int i = 0; i < m; i++) {
             re += (double)samples[i] * cos(w * (double)i);
             im -= (double)samples[i] * sin(w * (double)i);
         }
-        out[k] = (float)log1p(sqrt(re * re + im * im) / (double)m);
+        bands[b] = (float)log1p(sqrt(re * re + im * im) / (double)m);
+    }
+
+    /* Model-dependent transform: the projection derived from the model
+     * file turns the spectrum into the embedding. */
+    for (int k = 0; k < VP_DIM; k++) {
+        const float *row = e->proj + (size_t)k * VP_BANDS;
+        double s = 0.0;
+        for (int b = 0; b < VP_BANDS; b++) {
+            s += (double)row[b] * (double)bands[b];
+        }
+        out[k] = (float)tanh(s);
         if (cb != NULL && ((k & 63) == 63 || k == VP_DIM - 1)) {
             cb((double)(k + 1) / (double)VP_DIM, user);
         }

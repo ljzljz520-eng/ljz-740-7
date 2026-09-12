@@ -8,7 +8,7 @@ embeddings, compare similarity, release resources, and read error text.
 | File                | Role                                                        |
 |---------------------|-------------------------------------------------------------|
 | `vp.h`              | C ABI + memory-ownership contract                           |
-| `vp.c`              | Deterministic stub of the native library (swap for the real one) |
+| `vp.c`              | Deterministic stub of the native library (swap for the real one); its extraction projection is derived from the model file |
 | `bridge.c`          | Callback trampoline into the `//export`ed Go function       |
 | `voiceprint.go`     | The Go binding (`Engine`, `Extract`, `Similarity`, `Close`) |
 | `cmd/vpcmp`         | Example: print the similarity score of two WAV files        |
@@ -53,3 +53,8 @@ go run ./cmd/gentone -freq 1400 -out b.wav
 go run ./cmd/vpcmp -model model.bin a.wav a.wav   # similarity: 1.0000
 go run ./cmd/vpcmp -model model.bin a.wav b.wav   # similarity: much lower
 ```
+
+The stub derives its extraction projection from the model file bytes, so
+the model genuinely participates in feature computation: different model
+files give different embeddings for the same audio, while the same model
+file is fully deterministic.

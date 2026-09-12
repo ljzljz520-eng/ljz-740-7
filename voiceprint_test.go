@@ -79,6 +79,56 @@ func TestExtractAndSimilarity(t *testing.T) {
 	t.Logf("same=%.4f different=%.4f", same, diff)
 }
 
+func TestModelChangesEmbedding(t *testing.T) {
+	dir := t.TempDir()
+	modelA := filepath.Join(dir, "a.bin")
+	modelB := filepath.Join(dir, "b.bin")
+	if err := os.WriteFile(modelA, []byte("model weights A"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(modelB, []byte("model weights B"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	load := func(path string) *Engine {
+		t.Helper()
+		eng, err := LoadModel(path)
+		if err != nil {
+			t.Fatalf("LoadModel(%s): %v", path, err)
+		}
+		t.Cleanup(func() { eng.Close() })
+		return eng
+	}
+
+	samples := sine(440, 16000, 16000)
+	extract := func(path string) []float32 {
+		v, err := load(path).Extract(samples, 16000)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+
+	va, vb := extract(modelA), extract(modelB)
+	cross, err := Similarity(va, vb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cross > 0.999 {
+		t.Fatalf("different models must give different embeddings, similarity %f", cross)
+	}
+
+	// The same model file must always produce the same embedding.
+	same, err := Similarity(va, extract(modelA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if same < 0.999 {
+		t.Fatalf("same model must be deterministic, similarity %f", same)
+	}
+	t.Logf("cross-model=%.4f same-model=%.4f", cross, same)
+}
+
 func TestProgressCallback(t *testing.T) {
 	eng := newTestEngine(t)
 	var fracs []float64
